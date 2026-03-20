@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>点阵浮动效果（12秒循环+更快渐变+双倍移动速度）</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+/* ========== 关键修改1：body背景改为透明 ========== */
+body{overflow:hidden;background:transparent;}
+/* ========== 关键修改2：Canvas背景也设为透明 ========== */
+#dotCanvas{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:1;background:transparent;}
+.loading{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);color:#000;/* 加载文字改黑色，适配透明背景 */}
+</style>
+</head>
+<body>
+<div class="loading" id="loading">正在生成点阵...</div>
+<canvas id="dotCanvas"></canvas>
+
+<script>
+// ========== 1. 配置集中管理 + 常量命名优化 ==========
+const CONFIG = Object.freeze({
+  // 基础样式
+  DOT_SIZE: 1,
+  HOVER_SIZE: 2,
+  MAX_MOUSE_DISTANCE: 25,
+  // 速度控制
+  MOUSE_AVOID_SPEED: 0.3,
+  POS_RESET_SPEED: 0.04,
+  FLOAT_DURATION: 1000,       // 飘出/回正时长（2倍速）
+  // 点阵采样
+  SAMPLE_STEP: 5,
+  IMAGE_URL: 'https://raw.githubusercontent.com/angle-baiyang/baimu2/refs/heads/main/20260317-150432.png',
+  // 浮动控制
+  FLOAT_PROBABILITY: 0.25,    // 25% 触发概率
+  FLOAT_RANGE: 4,             // 浮动范围4px（±2px）
+  FLOAT_COOLDOWN: 600,        // 冷却时间
+  // 渐变循环
+  GRADIENT_SMOOTH: 0.1,       // 渐变过渡范围
+  CYCLE_DURATION: 12000,      // 完整循环12秒
+  GRADIENT_ACCELERATE: 1.8    // 渐变加速系数
+});
+
+// ========== 2. 工具函数抽离 ==========
+/**
+ * 缓动函数：减速曲线
+ * @param {number} t - 0~1的进度值
+ * @returns {number} 缓动后的进度
+ */
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+/**
+ * 计算两点之间的距离
+ * @param {number} x1 - 点1x坐标
+ * @param {number} y1 - 点1y坐标
+ * @param {number} x2 - 点2x坐标
+ * @param {number} y2 - 点2y坐标
+ * @returns {number} 距离
+ */
+const calculateDistance = (x1, y1, x2, y2) => Math.hypot(x1 - x2, y1 - y2);
+
+// ========== 3. 全局状态管理（避免零散变量） ==========
+const appState = {
+  canvas: null,
+  ctx: null,
+  dots: [],
+  mouseX: -9999,
+  mouseY: -9999,
+  gradientProgress: 0,
+  lastCycleResetTime: Date.now(),
+  animationId: null // 保存动画帧ID，用于销毁
+};
+
+// ========== 4. 核心方法封装 ==========
+/**
+ * 初始化画布尺寸
+ */
+const resizeCanvas = () => {
+  if (!appState.canvas) return;
+  appState.canvas.width = window.innerWidth;
+  appState.canvas.height = window.innerHeight;
+};
+
+/**
+ * 初始化点阵数据
+ */
+const initDots = () => {
+  appState.dots = [];
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  
+  // 图片加载错误处理（鲁棒性优化）
+  img.onerror = () => {
+    console.error('图片加载失败，请检查URL');
+    document.getElementById('loading').textContent = '加载失败，请刷新页面';
+  };
+
+  img.onload = () => {
+    try {
+      // 计算图片缩放比例和居中位置
+      const scale = Math.min(
+        appState.canvas.width * 0.8 / img.width,
+        appState.canvas.height * 0.8 / img.height
+      );
+      const drawX = (appState.canvas.width - img.width * scale) / 2;
+      const drawY = (appState.canvas.height - img.height * scale) / 2;
+
+      // 创建临时画布处理像素（性能优化：复用临时画布）
+      const tempCanvas = document.createElement('canvas');
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCanvas.width = img.width;
+      tempCanvas.height = img.height;
+      tempCtx.drawImage(img, 0, 0);
+
+      const imageData = tempCtx.getImageData(0, 0, img.width, img.height);
+      const pixels = imageData.data;
+      const pixelStep = CONFIG.SAMPLE_STEP;
+      const width = img.width;
+      const height = img.height;
+
+      // 性能优化：减少循环内的属性查找和计算
+      const canvasHeight = appState.canvas.height;
+      const floatRange = CONFIG.FLOAT_RANGE;
+      const dotSize = CONFIG.DOT_SIZE;
+
+      // 遍历像素生成点阵（性能优化：减少循环内的重复计算）
+      for (let y = 0; y < height; y += pixelStep) {
+        const yOffset = y * width * 4; // 预计算y轴像素偏移
+        for (let x = 0; x < width; x += pixelStep) {
+          const i = yOffset + x * 4;
+          // 只保留不透明的深色像素
+          if (pixels[i + 3] > 128 && (pixels[i] + pixels[i + 1] + pixels[i + 2] < 200)) {
+            const fx = drawX + x * scale;
+            const fy = drawY + y * scale;
+            const yRatio = 1 - (fy / canvasHeight);
+
+            appState.dots.push({
+              originX: fx,
+              originY: fy,
+              currentX: fx,
+              currentY: fy,
+              size: dotSize,
+              yRatio,
+              floatState: 'idle',
+              floatStartPos: { x: fx, y: fy },
+              floatTargetPos: { x: fx, y: fy },
+              floatStartTime: 0,
+              lastFloatTime: 0
+            });
+          }
+        }
+      }
+
+      document.getElementById('loading').style.display = 'none';
+      appState.lastCycleResetTime = Date.now();
+      startAnimation();
+    } catch (err) {
+      console.error('初始化点阵失败:', err);
+      document.getElementById('loading').textContent = '初始化失败，请刷新页面';
+    }
+  };
+
+  img.src = CONFIG.IMAGE_URL;
+};
+
+/**
+ * 处理渐变浮动逻辑
+ */
+const handleGradientFloat = () => {
+  const now = Date.now();
+  const cycleElapsed = now - appState.lastCycleResetTime;
+
+  // 重置循环进度
+  if (cycleElapsed >= CONFIG.CYCLE_DURATION) {
+    appState.gradientProgress = -CONFIG.GRADIENT_SMOOTH;
+    appState.lastCycleResetTime = now;
+  } else {
+    // 计算加速后的渐变进度
+    const cycleProgress = cycleElapsed / CONFIG.CYCLE_DURATION;
+    const acceleratedProgress = Math.min(cycleProgress * CONFIG.GRADIENT_ACCELERATE, 1);
+    appState.gradientProgress = -CONFIG.GRADIENT_SMOOTH + (1 + 2 * CONFIG.GRADIENT_SMOOTH) * acceleratedProgress;
+  }
+
+  // 性能优化：缓存常用配置和状态
+  const gradientProgress = appState.gradientProgress;
+  const gradientSmooth = CONFIG.GRADIENT_SMOOTH;
+  const floatCooldown = CONFIG.FLOAT_COOLDOWN;
+  const floatProbability = CONFIG.FLOAT_PROBABILITY;
+  const floatDuration = CONFIG.FLOAT_DURATION;
+  const floatRange = CONFIG.FLOAT_RANGE;
+  const mouseX = appState.mouseX;
+  const mouseY = appState.mouseY;
+  const maxMouseDistance = CONFIG.MAX_MOUSE_DISTANCE;
+
+  // 遍历点阵处理浮动
+  appState.dots.forEach(dot => {
+    // 判断是否在渐变范围内
+    const inGradientRange = dot.yRatio >= gradientProgress && dot.yRatio <= gradientProgress + gradientSmooth;
+
+    // 触发浮动条件
+    if (inGradientRange && dot.floatState === 'idle' && (now - dot.lastFloatTime) > floatCooldown && Math.random() < floatProbability) {
+      dot.floatStartPos = { x: dot.currentX, y: dot.currentY };
+      const rx = (Math.random() - 0.5) * 2 * floatRange;
+      dot.floatTargetPos = { x: dot.originX + rx, y: dot.originY };
+      dot.floatState = 'floating';
+      dot.floatStartTime = now;
+      dot.lastFloatTime = now;
+    }
+
+    // 鼠标靠近时强制回正
+    const distanceMouse = calculateDistance(mouseX, mouseY, dot.currentX, dot.currentY);
+    if (distanceMouse < maxMouseDistance && dot.floatState !== 'idle') {
+      dot.floatState = 'backing';
+      dot.floatStartPos = { x: dot.currentX, y: dot.currentY };
+      dot.floatTargetPos = { x: dot.originX, y: dot.originY };
+      dot.floatStartTime = now;
+    }
+
+    // 处理浮动/回正动画
+    const elapsed = now - dot.floatStartTime;
+    let progress = 0;
+
+    switch (dot.floatState) {
+      case 'floating':
+        if (elapsed >= floatDuration) {
+          dot.floatState = 'backing';
+          dot.floatStartPos = { x: dot.currentX, y: dot.currentY };
+          dot.floatTargetPos = { x: dot.originX, y: dot.originY };
+          dot.floatStartTime = now;
+        } else {
+          progress = Math.min(elapsed / floatDuration, 1);
+          dot.currentX = dot.floatStartPos.x + (dot.floatTargetPos.x - dot.floatStartPos.x) * progress;
+          dot.currentY = dot.floatStartPos.y + (dot.floatTargetPos.y - dot.floatStartPos.y) * progress;
+        }
+        break;
+
+      case 'backing':
+        if (elapsed >= floatDuration) {
+          dot.floatState = 'idle';
+          dot.currentX = dot.originX;
+          dot.currentY = dot.originY;
+        } else {
+          progress = Math.min(elapsed / floatDuration, 1);
+          const easedProgress = easeOutCubic(progress);
+          dot.currentX = dot.floatStartPos.x + (dot.floatTargetPos.x - dot.floatStartPos.x) * easedProgress;
+          dot.currentY = dot.floatStartPos.y + (dot.floatTargetPos.y - dot.floatStartPos.y) * easedProgress;
+        }
+        break;
+    }
+  });
+};
+
+/**
+ * 绘制点阵
+ */
+const drawDots = () => {
+  // 性能优化：批量清除画布（比逐帧清除更高效）
+  appState.ctx.clearRect(0, 0, appState.canvas.width, appState.canvas.height);
+  // 点阵颜色保持黑色
+  appState.ctx.fillStyle = '#000';
+
+  // 性能优化：减少循环内的属性查找
+  const ctx = appState.ctx;
+  appState.dots.forEach(dot => {
+    ctx.beginPath();
+    ctx.arc(dot.currentX, dot.currentY, dot.size, 0, Math.PI * 2);
+    ctx.fill();
+  });
+};
+
+/**
+ * 更新点阵状态
+ */
+const updateDots = () => {
+  handleGradientFloat();
+
+  // 处理鼠标交互
+  const mouseX = appState.mouseX;
+  const mouseY = appState.mouseY;
+  const maxDistance = CONFIG.MAX_MOUSE_DISTANCE;
+  const avoidSpeed = CONFIG.MOUSE_AVOID_SPEED;
+  const resetSpeed = CONFIG.POS_RESET_SPEED;
+  const dotSize = CONFIG.DOT_SIZE;
+  const hoverSize = CONFIG.HOVER_SIZE;
+
+  appState.dots.forEach(dot => {
+    const distance = calculateDistance(mouseX, mouseY, dot.currentX, dot.currentY);
+
+    if (distance < maxDistance) {
+      // 鼠标靠近：避让
+      const dx = mouseX - dot.currentX;
+      const dy = mouseY - dot.currentY;
+      const offsetX = dx / distance * (maxDistance - distance) * avoidSpeed;
+      const offsetY = dy / distance * (maxDistance - distance) * avoidSpeed;
+      dot.currentX -= offsetX;
+      dot.currentY -= offsetY;
+      dot.size = hoverSize;
+    } else {
+      // 鼠标远离：复位
+      if (dot.floatState === 'idle') {
+        dot.currentX += (dot.originX - dot.currentX) * resetSpeed;
+        dot.currentY += (dot.originY - dot.currentY) * resetSpeed;
+      }
+      dot.size = dotSize;
+    }
+  });
+};
+
+/**
+ * 动画主循环
+ */
+const animate = () => {
+  updateDots();
+  drawDots();
+  appState.animationId = requestAnimationFrame(animate);
+};
+
+/**
+ * 启动动画
+ */
+const startAnimation = () => {
+  // 先停止之前的动画（避免重复渲染）
+  if (appState.animationId) {
+    cancelAnimationFrame(appState.animationId);
+  }
+  animate();
+};
+
+/**
+ * 初始化应用
+ */
+const initApp = () => {
+  // 获取DOM元素
+  appState.canvas = document.getElementById('dotCanvas');
+  appState.ctx = appState.canvas.getContext('2d');
+
+  // 初始化画布
+  resizeCanvas();
+
+  // 绑定事件（性能优化：使用被动监听）
+  window.addEventListener('resize', () => {
+    resizeCanvas();
+    initDots();
+  }, { passive: true });
+
+  window.addEventListener('mousemove', (e) => {
+    appState.mouseX = e.clientX;
+    appState.mouseY = e.clientY;
+  }, { passive: true });
+
+  // 初始化点阵
+  initDots();
+
+  // 页面卸载时清理资源（鲁棒性优化）
+  window.addEventListener('beforeunload', () => {
+    if (appState.animationId) {
+      cancelAnimationFrame(appState.animationId);
+    }
+    appState.dots = [];
+  });
+};
+
+// 启动应用
+initApp();
+</script>
+</body>
+</html>
